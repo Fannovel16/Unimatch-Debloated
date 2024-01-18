@@ -1,8 +1,15 @@
-# Minimal fork for (Unimatch)[https://github.com/autonomousvision/unimatch]
+# Minimal fork for Unimatch
+Evalutation code is removed so that it can works on Windows without WSL
+
+All right to the original authors of (Unifying Flow, Stereo and Depth Estimation)[https://github.com/autonomousvision/unimatch]
+## Installation
 ```bash
 git clone https://github.com/Fannovel16/Unimatch-Debloated
 cd Unimatch-Debloated
 pip install -r requirements.txt
+```
+## Optical Flow Estimation
+```
 python main_flow.py --inference_video test.mp4 \
 --resume gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth \
 --output_path output \
