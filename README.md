@@ -3,7 +3,7 @@
 git clone https://github.com/Fannovel16/Unimatch-Debloated
 cd Unimatch-Debloated
 pip install -r requirements.txt
-python main.py --inference_video test.mp4 \
+python main_flow.py --inference_video test.mp4 \
 --resume gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth \
 --output_path output \
 --padding_factor 32 \
