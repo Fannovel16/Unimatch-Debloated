@@ -1,24 +1,18 @@
-import torch
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-
-import argparse
-import numpy as np
+from PIL import Image
 import os
+import numpy as np
+import torch
+import torch.nn.functional as F
 
-from dataloader.flow.datasets import build_train_dataset
+from utils import frame_utils
+from utils.flow_viz import save_vis_flow_tofile, flow_to_image
+import imageio
+
+from glob import glob
+from unimatch.geometry import forward_backward_consistency_check
+from utils.file_io import extract_video
 from unimatch.unimatch import UniMatch
-from loss.flow_loss import flow_loss_func
-
-from evaluate_flow import (validate_chairs, validate_things, validate_sintel, validate_kitti,
-                           create_kitti_submission, create_sintel_submission,
-                           inference_flow,
-                           )
-
-from utils.logger import Logger
-from utils import misc
-from utils.dist_utils import get_dist_info, init_dist, setup_for_distributed
-
+import argparse
 
 def get_args_parser():
     parser = argparse.ArgumentParser()
@@ -132,47 +126,10 @@ def get_args_parser():
     parser.add_argument('--debug', action='store_true')
 
     return parser
-
-
-def main(args):
-    print_info = not args.eval and not args.submission and args.inference_dir is None and args.inference_video is None
-
-    if print_info and args.local_rank == 0:
-        print(args)
-        misc.save_args(args)
-        misc.check_path(args.checkpoint_dir)
-        misc.save_command(args.checkpoint_dir)
-
-    misc.check_path(args.output_path)
-
-    seed = args.seed
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(args.seed)
-    np.random.seed(seed)
-
-    torch.backends.cudnn.benchmark = True
-
-    if args.launcher == 'none':
-        args.distributed = False
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        args.distributed = True
-
-        # adjust batch size for each gpu
-        assert args.batch_size % torch.cuda.device_count() == 0
-        args.batch_size = args.batch_size // torch.cuda.device_count()
-
-        dist_params = dict(backend='nccl')
-        init_dist(args.launcher, **dist_params)
-        # re-set gpu_ids with distributed training mode
-        _, world_size = get_dist_info()
-        args.gpu_ids = range(world_size)
-        device = torch.device('cuda:{}'.format(args.local_rank))
-
-        setup_for_distributed(args.local_rank == 0)
-
-    # model
-    model = UniMatch(feature_channels=args.feature_channels,
+parser = get_args_parser()
+args = parser.parse_args()
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = UniMatch(feature_channels=args.feature_channels,
                      num_scales=args.num_scales,
                      upsample_factor=args.upsample_factor,
                      num_head=args.num_head,
@@ -181,174 +138,202 @@ def main(args):
                      reg_refine=args.reg_refine,
                      task=args.task).to(device)
 
-    if print_info:
-        print(model)
+@torch.no_grad()
+def inference_flow(model,
+                   inference_dir,
+                   inference_video=None,
+                   output_path='output',
+                   padding_factor=8,
+                   inference_size=None,
+                   save_flo_flow=False,  # save raw flow prediction as .flo
+                   attn_type='swin',
+                   attn_splits_list=None,
+                   corr_radius_list=None,
+                   prop_radius_list=None,
+                   num_reg_refine=1,
+                   pred_bidir_flow=False,
+                   pred_bwd_flow=False,
+                   fwd_bwd_consistency_check=False,
+                   save_video=False,
+                   concat_flow_img=False,
+                   ):
+    """ Inference on a directory or a video """
+    model.eval()
 
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model.to(device),
-            device_ids=[args.local_rank],
-            output_device=args.local_rank)
-        model_without_ddp = model.module
+    if fwd_bwd_consistency_check:
+        assert pred_bidir_flow
+
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+
+    if save_video:
+        assert inference_video is not None
+
+    fixed_inference_size = inference_size
+    transpose_img = False
+
+    if inference_video is not None:
+        filenames, fps = extract_video(inference_video)  # list of [H, W, 3]
     else:
-        if torch.cuda.device_count() > 1:
-            print('Use %d GPUs' % torch.cuda.device_count())
-            model = torch.nn.DataParallel(model)
+        filenames = sorted(glob(inference_dir + '/*.png') + glob(inference_dir + '/*.jpg'))
+    print('%d images found' % len(filenames))
 
-            model_without_ddp = model.module
+    vis_flow_preds = []
+    ori_imgs = []
+
+    for test_id in range(0, len(filenames) - 1):
+        if (test_id + 1) % 50 == 0:
+            print('predicting %d/%d' % (test_id + 1, len(filenames)))
+
+        if inference_video is not None:
+            image1 = filenames[test_id]
+            image2 = filenames[test_id + 1]
         else:
-            model_without_ddp = model
+            image1 = frame_utils.read_gen(filenames[test_id])
+            image2 = frame_utils.read_gen(filenames[test_id + 1])
 
-    num_params = sum(p.numel() for p in model.parameters())
-    if print_info:
-        print('Number of params:', num_params)
-    if not args.eval and not args.submission and args.inference_dir is None and args.inference_video is None:
-        save_name = '%d_parameters' % num_params
-        open(os.path.join(args.checkpoint_dir, save_name), 'a').close()
+        image1 = np.array(image1).astype(np.uint8)
+        image2 = np.array(image2).astype(np.uint8)
 
-    optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=args.lr,
-                                  weight_decay=args.weight_decay)
-
-    start_epoch = 0
-    start_step = 0
-    # resume checkpoints
-    if args.resume:
-        print('Load checkpoint: %s' % args.resume)
-
-        loc = 'cuda:{}'.format(args.local_rank) if torch.cuda.is_available() else 'cpu'
-        checkpoint = torch.load(args.resume, map_location=loc)
-
-        model_without_ddp.load_state_dict(checkpoint['model'], strict=args.strict_resume)
-
-        if 'optimizer' in checkpoint and 'step' in checkpoint and 'epoch' in checkpoint and not \
-                args.no_resume_optimizer:
-            print('Load optimizer')
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            start_epoch = checkpoint['epoch']
-            start_step = checkpoint['step']
-
-        if print_info:
-            print('start_epoch: %d, start_step: %d' % (start_epoch, start_step))
-
-    # evaluate
-    if args.eval:
-        val_results = {}
-
-        if 'chairs' in args.val_dataset:
-            results_dict = validate_chairs(model_without_ddp,
-                                           with_speed_metric=args.with_speed_metric,
-                                           attn_type=args.attn_type,
-                                           attn_splits_list=args.attn_splits_list,
-                                           corr_radius_list=args.corr_radius_list,
-                                           prop_radius_list=args.prop_radius_list,
-                                           num_reg_refine=args.num_reg_refine,
-                                           )
-
-            val_results.update(results_dict)
-
-        if 'things' in args.val_dataset:
-            results_dict = validate_things(model_without_ddp,
-                                           padding_factor=args.padding_factor,
-                                           with_speed_metric=args.with_speed_metric,
-                                           attn_type=args.attn_type,
-                                           attn_splits_list=args.attn_splits_list,
-                                           corr_radius_list=args.corr_radius_list,
-                                           prop_radius_list=args.prop_radius_list,
-                                           num_reg_refine=args.num_reg_refine,
-                                           val_things_clean_only=args.val_things_clean_only,
-                                           )
-            val_results.update(results_dict)
-
-        if 'sintel' in args.val_dataset:
-            results_dict = validate_sintel(model_without_ddp,
-                                           count_time=args.count_time,
-                                           padding_factor=args.padding_factor,
-                                           with_speed_metric=args.with_speed_metric,
-                                           evaluate_matched_unmatched=args.evaluate_matched_unmatched,
-                                           attn_type=args.attn_type,
-                                           attn_splits_list=args.attn_splits_list,
-                                           corr_radius_list=args.corr_radius_list,
-                                           prop_radius_list=args.prop_radius_list,
-                                           num_reg_refine=args.num_reg_refine,
-                                           )
-            val_results.update(results_dict)
-
-        if 'kitti' in args.val_dataset:
-            results_dict = validate_kitti(model_without_ddp,
-                                          padding_factor=args.padding_factor,
-                                          with_speed_metric=args.with_speed_metric,
-                                          attn_type=args.attn_type,
-                                          attn_splits_list=args.attn_splits_list,
-                                          corr_radius_list=args.corr_radius_list,
-                                          prop_radius_list=args.prop_radius_list,
-                                          num_reg_refine=args.num_reg_refine,
-                                          debug=args.debug,
-                                          )
-            val_results.update(results_dict)
-
-        if args.save_eval_to_file:
-            misc.check_path(args.checkpoint_dir)
-            # save validation results
-            val_file = os.path.join(args.checkpoint_dir, 'val_results.txt')
-            with open(val_file, 'a') as f:
-                f.write('\neval results after training done\n\n')
-                metrics = ['chairs_epe', 'chairs_s0_10', 'chairs_s10_40', 'chairs_s40+',
-                           'things_clean_epe', 'things_clean_s0_10', 'things_clean_s10_40', 'things_clean_s40+',
-                           'things_final_epe', 'things_final_s0_10', 'things_final_s10_40', 'things_final_s40+',
-                           'sintel_clean_epe', 'sintel_clean_s0_10', 'sintel_clean_s10_40', 'sintel_clean_s40+',
-                           'sintel_final_epe', 'sintel_final_s0_10', 'sintel_final_s10_40', 'sintel_final_s40+',
-                           'kitti_epe', 'kitti_f1', 'kitti_s0_10', 'kitti_s10_40', 'kitti_s40+',
-                           ]
-                eval_metrics = [metric for metric in metrics if metric in val_results.keys()]
-                metrics_values = [val_results[metric] for metric in eval_metrics]
-
-                num_metrics = len(eval_metrics)
-
-                # save as markdown format
-                f.write(("| {:>20} " * num_metrics + '\n').format(*eval_metrics))
-                f.write(("| {:20.3f} " * num_metrics).format(*metrics_values))
-
-                f.write('\n\n')
-
-        return
-
-    # sintel and kitti submission
-    if args.submission:
-        # NOTE: args.val_dataset is a list
-        if args.val_dataset[0] == 'sintel':
-            create_sintel_submission(model_without_ddp,
-                                     output_path=args.output_path,
-                                     padding_factor=args.padding_factor,
-                                     save_vis_flow=args.save_vis_flow,
-                                     no_save_flo=args.no_save_flo,
-                                     attn_type=args.attn_type,
-                                     attn_splits_list=args.attn_splits_list,
-                                     corr_radius_list=args.corr_radius_list,
-                                     prop_radius_list=args.prop_radius_list,
-                                     num_reg_refine=args.num_reg_refine,
-                                     inference_size=args.inference_size,
-                                     )
-        elif args.val_dataset[0] == 'kitti':
-            create_kitti_submission(model_without_ddp,
-                                    output_path=args.output_path,
-                                    padding_factor=args.padding_factor,
-                                    save_vis_flow=args.save_vis_flow,
-                                    attn_type=args.attn_type,
-                                    attn_splits_list=args.attn_splits_list,
-                                    corr_radius_list=args.corr_radius_list,
-                                    prop_radius_list=args.prop_radius_list,
-                                    num_reg_refine=args.num_reg_refine,
-                                    inference_size=args.inference_size,
-                                    )
-
+        if len(image1.shape) == 2:  # gray image
+            image1 = np.tile(image1[..., None], (1, 1, 3))
+            image2 = np.tile(image2[..., None], (1, 1, 3))
         else:
-            raise ValueError(f'Not supported dataset for submission')
+            image1 = image1[..., :3]
+            image2 = image2[..., :3]
 
-        return
+        if concat_flow_img:
+            ori_imgs.append(image1)
 
-    # inferece on a dir or video
-    if args.inference_dir is not None or args.inference_video is not None:
-        inference_flow(model_without_ddp,
+        image1 = torch.from_numpy(image1).permute(2, 0, 1).float().unsqueeze(0).to(device)
+        image2 = torch.from_numpy(image2).permute(2, 0, 1).float().unsqueeze(0).to(device)
+
+        # the model is trained with size: width > height
+        if image1.size(-2) > image1.size(-1):
+            image1 = torch.transpose(image1, -2, -1)
+            image2 = torch.transpose(image2, -2, -1)
+            transpose_img = True
+
+        nearest_size = [int(np.ceil(image1.size(-2) / padding_factor)) * padding_factor,
+                        int(np.ceil(image1.size(-1) / padding_factor)) * padding_factor]
+
+        # resize to nearest size or specified size
+        inference_size = nearest_size if fixed_inference_size is None else fixed_inference_size
+
+        assert isinstance(inference_size, list) or isinstance(inference_size, tuple)
+        ori_size = image1.shape[-2:]
+
+        # resize before inference
+        if inference_size[0] != ori_size[0] or inference_size[1] != ori_size[1]:
+            image1 = F.interpolate(image1, size=inference_size, mode='bilinear',
+                                   align_corners=True)
+            image2 = F.interpolate(image2, size=inference_size, mode='bilinear',
+                                   align_corners=True)
+
+        if pred_bwd_flow:
+            image1, image2 = image2, image1
+
+        results_dict = model(image1, image2,
+                             attn_type=attn_type,
+                             attn_splits_list=attn_splits_list,
+                             corr_radius_list=corr_radius_list,
+                             prop_radius_list=prop_radius_list,
+                             num_reg_refine=num_reg_refine,
+                             task='flow',
+                             pred_bidir_flow=pred_bidir_flow,
+                             )
+
+        flow_pr = results_dict['flow_preds'][-1]  # [B, 2, H, W]
+
+        # resize back
+        if inference_size[0] != ori_size[0] or inference_size[1] != ori_size[1]:
+            flow_pr = F.interpolate(flow_pr, size=ori_size, mode='bilinear',
+                                    align_corners=True)
+            flow_pr[:, 0] = flow_pr[:, 0] * ori_size[-1] / inference_size[-1]
+            flow_pr[:, 1] = flow_pr[:, 1] * ori_size[-2] / inference_size[-2]
+
+        if transpose_img:
+            flow_pr = torch.transpose(flow_pr, -2, -1)
+
+        flow = flow_pr[0].permute(1, 2, 0).cpu().numpy()  # [H, W, 2]
+
+        if inference_video is not None:
+            output_file = os.path.join(output_path, '%04d_flow.png' % test_id)
+        else:
+            output_file = os.path.join(output_path, os.path.basename(filenames[test_id])[:-4] + '_flow.png')
+
+        if inference_video is not None and save_video:
+            vis_flow_preds.append(flow_to_image(flow))
+        else:
+            # save vis flow
+            save_vis_flow_tofile(flow, output_file)
+
+        # also predict backward flow
+        if pred_bidir_flow:
+            assert flow_pr.size(0) == 2  # [2, H, W, 2]
+            flow_bwd = flow_pr[1].permute(1, 2, 0).cpu().numpy()  # [H, W, 2]
+
+            if inference_video is not None:
+                output_file = os.path.join(output_path, '%04d_flow_bwd.png' % test_id)
+            else:
+                output_file = os.path.join(output_path, os.path.basename(filenames[test_id])[:-4] + '_flow_bwd.png')
+
+            # save vis flow
+            save_vis_flow_tofile(flow_bwd, output_file)
+
+            # forward-backward consistency check
+            # occlusion is 1
+            if fwd_bwd_consistency_check:
+                fwd_occ, bwd_occ = forward_backward_consistency_check(flow_pr[:1], flow_pr[1:])  # [1, H, W] float
+
+                if inference_video is not None:
+                    fwd_occ_file = os.path.join(output_path, '%04d_occ_fwd.png' % test_id)
+                    bwd_occ_file = os.path.join(output_path, '%04d_occ_bwd.png' % test_id)
+                else:
+                    fwd_occ_file = os.path.join(output_path, os.path.basename(filenames[test_id])[:-4] + '_occ_fwd.png')
+                    bwd_occ_file = os.path.join(output_path, os.path.basename(filenames[test_id])[:-4] + '_occ_bwd.png')
+
+                Image.fromarray((fwd_occ[0].cpu().numpy() * 255.).astype(np.uint8)).save(fwd_occ_file)
+                Image.fromarray((bwd_occ[0].cpu().numpy() * 255.).astype(np.uint8)).save(bwd_occ_file)
+
+        if save_flo_flow:
+            if inference_video is not None:
+                output_file = os.path.join(output_path, '%04d_pred.flo' % test_id)
+            else:
+                output_file = os.path.join(output_path, os.path.basename(filenames[test_id])[:-4] + '_pred.flo')
+            frame_utils.writeFlow(output_file, flow)
+            if pred_bidir_flow:
+                if inference_video is not None:
+                    output_file_bwd = os.path.join(output_path, '%04d_pred_bwd.flo' % test_id)
+                else:
+                    output_file_bwd = os.path.join(output_path, os.path.basename(filenames[test_id])[:-4] + '_pred_bwd.flo')
+                frame_utils.writeFlow(output_file_bwd, flow_bwd)
+
+    if save_video:
+        suffix = '_flow_img.mp4' if concat_flow_img else '_flow.mp4'
+        output_file = os.path.join(output_path, os.path.basename(inference_video)[:-4] + suffix)
+
+        if concat_flow_img:
+            results = []
+            assert len(ori_imgs) == len(vis_flow_preds)
+
+            concat_axis = 0 if ori_imgs[0].shape[0] < ori_imgs[0].shape[1] else 1
+            for img, flow in zip(ori_imgs, vis_flow_preds):
+                concat = np.concatenate((img, flow), axis=concat_axis)
+                results.append(concat)
+        else:
+            results = vis_flow_preds
+
+        imageio.mimwrite(output_file, results, fps=fps, quality=8)
+
+    print('Done!')
+
+if __name__ == "__main__":
+    checkpoint = torch.load(args.resume, map_location="cpu")
+    for x in checkpoint['model']:
+        checkpoint['model'][x].to(device)
+    model.load_state_dict(checkpoint['model'], strict=args.strict_resume)
+    inference_flow(model,
                        inference_dir=args.inference_dir,
                        inference_video=args.inference_video,
                        output_path=args.output_path,
@@ -364,248 +349,4 @@ def main(args):
                        num_reg_refine=args.num_reg_refine,
                        fwd_bwd_consistency_check=args.fwd_bwd_check,
                        save_video=args.save_video,
-                       concat_flow_img=args.concat_flow_img,
-                       )
-
-        return
-
-    train_dataset = build_train_dataset(args)
-    print('Number of training images:', len(train_dataset))
-
-    # multi-processing
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_dataset,
-            num_replicas=torch.cuda.device_count(),
-            rank=args.local_rank)
-    else:
-        train_sampler = None
-
-    shuffle = False if args.distributed else True
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size,
-                                               shuffle=shuffle, num_workers=args.num_workers,
-                                               pin_memory=True, drop_last=True,
-                                               sampler=train_sampler)
-
-    last_epoch = start_step if args.resume and start_step > 0 else -1
-    lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, args.lr,
-        args.num_steps + 10,
-        pct_start=0.05,
-        cycle_momentum=False,
-        anneal_strategy='cos',
-        last_epoch=last_epoch,
-    )
-
-    if args.local_rank == 0:
-        summary_writer = SummaryWriter(args.checkpoint_dir)
-        logger = Logger(lr_scheduler, summary_writer, args.summary_freq,
-                        start_step=start_step)
-
-    total_steps = start_step
-    epoch = start_epoch
-    print('Start training')
-
-    while total_steps < args.num_steps:
-        model.train()
-
-        # mannually change random seed for shuffling every epoch
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
-
-        for i, sample in enumerate(train_loader):
-            img1, img2, flow_gt, valid = [x.to(device) for x in sample]
-
-            results_dict = model(img1, img2,
-                                 attn_type=args.attn_type,
-                                 attn_splits_list=args.attn_splits_list,
-                                 corr_radius_list=args.corr_radius_list,
-                                 prop_radius_list=args.prop_radius_list,
-                                 num_reg_refine=args.num_reg_refine,
-                                 task='flow',
-                                 )
-
-            flow_preds = results_dict['flow_preds']
-
-            loss, metrics = flow_loss_func(flow_preds, flow_gt, valid,
-                                           gamma=args.gamma,
-                                           max_flow=args.max_flow,
-                                           )
-
-            if isinstance(loss, float):
-                continue
-
-            if torch.isnan(loss):
-                continue
-
-            metrics.update({'total_loss': loss.item()})
-
-            # more efficient zero_grad
-            for param in model_without_ddp.parameters():
-                param.grad = None
-
-            loss.backward()
-
-            # gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
-            optimizer.step()
-
-            lr_scheduler.step()
-
-            if args.local_rank == 0:
-                logger.push(metrics)
-
-                logger.add_image_summary(img1, img2, flow_preds, flow_gt)
-
-            total_steps += 1
-
-            if total_steps % args.save_ckpt_freq == 0 or total_steps == args.num_steps:
-                if args.local_rank == 0:
-                    print('Save checkpoint at step: %d' % total_steps)
-                    checkpoint_path = os.path.join(args.checkpoint_dir, 'step_%06d.pth' % total_steps)
-                    torch.save({
-                        'model': model_without_ddp.state_dict()
-                    }, checkpoint_path)
-
-            if total_steps % args.save_latest_ckpt_freq == 0:
-                checkpoint_path = os.path.join(args.checkpoint_dir, 'checkpoint_latest.pth')
-
-                if args.local_rank == 0:
-                    torch.save({
-                        'model': model_without_ddp.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'step': total_steps,
-                        'epoch': epoch,
-                    }, checkpoint_path)
-
-            if total_steps % args.val_freq == 0:
-                print('Start validation')
-
-                val_results = {}
-                # support validation on multiple datasets
-                if 'chairs' in args.val_dataset:
-                    results_dict = validate_chairs(model_without_ddp,
-                                                   with_speed_metric=args.with_speed_metric,
-                                                   attn_type=args.attn_type,
-                                                   attn_splits_list=args.attn_splits_list,
-                                                   corr_radius_list=args.corr_radius_list,
-                                                   prop_radius_list=args.prop_radius_list,
-                                                   num_reg_refine=args.num_reg_refine,
-                                                   )
-                    if args.local_rank == 0:
-                        val_results.update(results_dict)
-
-                if 'things' in args.val_dataset:
-                    results_dict = validate_things(model_without_ddp,
-                                                   padding_factor=args.padding_factor,
-                                                   with_speed_metric=args.with_speed_metric,
-                                                   val_things_clean_only=args.val_things_clean_only,
-                                                   attn_type=args.attn_type,
-                                                   attn_splits_list=args.attn_splits_list,
-                                                   corr_radius_list=args.corr_radius_list,
-                                                   prop_radius_list=args.prop_radius_list,
-                                                   num_reg_refine=args.num_reg_refine,
-                                                   )
-                    if args.local_rank == 0:
-                        val_results.update(results_dict)
-
-                if 'sintel' in args.val_dataset:
-                    results_dict = validate_sintel(model_without_ddp,
-                                                   padding_factor=args.padding_factor,
-                                                   with_speed_metric=args.with_speed_metric,
-                                                   evaluate_matched_unmatched=args.evaluate_matched_unmatched,
-                                                   attn_type=args.attn_type,
-                                                   attn_splits_list=args.attn_splits_list,
-                                                   corr_radius_list=args.corr_radius_list,
-                                                   prop_radius_list=args.prop_radius_list,
-                                                   num_reg_refine=args.num_reg_refine,
-                                                   )
-                    if args.local_rank == 0:
-                        val_results.update(results_dict)
-
-                if 'kitti' in args.val_dataset:
-                    results_dict = validate_kitti(model_without_ddp,
-                                                  padding_factor=args.padding_factor,
-                                                  with_speed_metric=args.with_speed_metric,
-                                                  attn_type=args.attn_type,
-                                                  attn_splits_list=args.attn_splits_list,
-                                                  corr_radius_list=args.corr_radius_list,
-                                                  prop_radius_list=args.prop_radius_list,
-                                                  num_reg_refine=args.num_reg_refine,
-                                                  )
-                    if args.local_rank == 0:
-                        val_results.update(results_dict)
-
-                if args.local_rank == 0:
-
-                    logger.write_dict(val_results)
-
-                    val_file = os.path.join(args.checkpoint_dir, 'val_results.txt')
-                    with open(val_file, 'a') as f:
-                        f.write('step: %06d\n' % total_steps)
-                        if args.evaluate_matched_unmatched:
-                            metrics = ['chairs_epe', 'chairs_matched', 'chairs_unmatched',
-                                       'chairs_s0_10', 'chairs_s10_40', 'chairs_s40+',
-                                       'things_clean_epe', 'things_clean_s0_10', 'things_clean_s10_40',
-                                       'things_clean_s40+',
-                                       'things_final_epe', 'things_final_s0_10', 'things_final_s10_40',
-                                       'things_final_s40+',
-                                       'sintel_clean_epe', 'sintel_clean_matched', 'sintel_clean_unmatched',
-                                       'sintel_clean_s0_10', 'sintel_clean_s10_40',
-                                       'sintel_clean_s40+',
-                                       'sintel_final_epe', 'sintel_final_matched', 'sintel_final_unmatched',
-                                       'sintel_final_s0_10', 'sintel_final_s10_40',
-                                       'sintel_final_s40+',
-                                       'kitti_epe', 'kitti_f1', 'kitti_s0_10', 'kitti_s10_40', 'kitti_s40+',
-                                       ]
-                        else:
-                            metrics = ['chairs_epe', 'chairs_s0_10', 'chairs_s10_40', 'chairs_s40+',
-                                       'things_clean_epe', 'things_clean_s0_10', 'things_clean_s10_40',
-                                       'things_clean_s40+',
-                                       'things_final_epe', 'things_final_s0_10', 'things_final_s10_40',
-                                       'things_final_s40+',
-                                       'sintel_clean_epe', 'sintel_clean_s0_10', 'sintel_clean_s10_40',
-                                       'sintel_clean_s40+',
-                                       'sintel_final_epe', 'sintel_final_s0_10', 'sintel_final_s10_40',
-                                       'sintel_final_s40+',
-                                       'kitti_epe', 'kitti_f1', 'kitti_s0_10', 'kitti_s10_40', 'kitti_s40+',
-                                       ]
-
-                        eval_metrics = []
-                        for metric in metrics:
-                            if metric in val_results.keys():
-                                eval_metrics.append(metric)
-
-                        metrics_values = [val_results[metric] for metric in eval_metrics]
-
-                        num_metrics = len(eval_metrics)
-
-                        # save as markdown format
-                        if args.evaluate_matched_unmatched:
-                            f.write(("| {:>25} " * num_metrics + '\n').format(*eval_metrics))
-                            f.write(("| {:25.3f} " * num_metrics).format(*metrics_values))
-                        else:
-                            f.write(("| {:>20} " * num_metrics + '\n').format(*eval_metrics))
-                            f.write(("| {:20.3f} " * num_metrics).format(*metrics_values))
-
-                        f.write('\n\n')
-
-                model.train()
-
-            if total_steps >= args.num_steps:
-                print('Training done')
-
-                return
-
-        epoch += 1
-
-
-if __name__ == '__main__':
-    parser = get_args_parser()
-    args = parser.parse_args()
-
-    if 'LOCAL_RANK' not in os.environ:
-        os.environ['LOCAL_RANK'] = str(args.local_rank)
-
-    main(args)
+                       concat_flow_img=args.concat_flow_img)
