@@ -1,7 +1,7 @@
 # Minimal fork for Unimatch
 Evalutation code is removed so that it can works on Windows without WSL
 
-All right to the original authors of (Unifying Flow, Stereo and Depth Estimation)[https://github.com/autonomousvision/unimatch]
+All right to the original authors of [Unifying Flow, Stereo and Depth Estimation](https://github.com/autonomousvision/unimatch)
 ## Installation
 ```bash
 git clone https://github.com/Fannovel16/Unimatch-Debloated
